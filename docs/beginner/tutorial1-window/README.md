@@ -10,7 +10,7 @@ For the beginner stuff, we're going to keep things very simple. We'll add things
 
 ```toml
 [dependencies]
-winit = { version = "0.29", features = ["rwh_05"] }
+winit = { version = "0.30", features = ["rwh_05"] }
 env_logger = "0.10"
 log = "0.4"
 wgpu = "22.0"
@@ -18,11 +18,7 @@ wgpu = "22.0"
 
 <div class="warning">
 
-Note that we are using version `0.29` of winit. This is not the most recent version.
-The reason for this is version `0.30` and beyond include breaking changes that will
-require a lot of code changes. I've created a local branch to mess around with it, but
-there's a work around on the [tracking issue](https://github.com/sotrh/learn-wgpu/issues/549)
-if you absolutely need the latest version of winit.
+Note that we are using version `0.30` of winit. This version is very different than `0.29` and before.
 
 </div>
 
@@ -34,52 +30,81 @@ As of version 0.10, wgpu requires Cargo's [newest feature resolver](https://doc.
 
 It is very important to enable logging via `env_logger::init();`.
 When wgpu hits any error, it panics with a generic message, while logging the real error via the log crate.
-This means if you don't include `env_logger::init()`, wgpu will fail silently, leaving you very confused!  
+This means if you don't include `env_logger::init()`, wgpu will fail silently, leaving you very confused!
 (This has been done in the code below)
 
 ## Create a new project
 
-run ```cargo new project_name``` where project_name is the name of the project.  
+run ```cargo new project_name``` where project_name is the name of the project.
 (In the example below, I have used 'tutorial1_window')
 
 ## The code
 
-There's not much going on here yet, so I'm just going to post the code in full. Just paste this into your `lib.rs` or equivalent.
+With `winit 0.30` the code to get started is a little more complicated. `winit` exposes a trait `ApplicationHandler` that we need to implement for our app.
+We'll simply represent our app as an enum reflecting it's internal state and go from there.
 
 ```rust
 use winit::{
+    application::ApplicationHandler,
     event::*,
     event_loop::EventLoop,
     keyboard::{KeyCode, PhysicalKey},
-    window::WindowBuilder,
+    window::Window,
 };
+
+struct AppState {
+    window: Window,
+}
+
+enum App {
+    Uninitialized,
+    Initialized(AppState),
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        log::debug!("Resumed");
+
+        let window = event_loop
+            .create_window(Window::default_attributes())
+            .unwrap();
+
+        *self = App::Initialized(AppState { window });
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        if let App::Initialized(app_state) = self {
+            if window_id == app_state.window.id() {
+                match event {
+                    WindowEvent::CloseRequested
+                    | WindowEvent::KeyboardInput {
+                        event:
+                            KeyEvent {
+                                state: ElementState::Pressed,
+                                physical_key: PhysicalKey::Code(KeyCode::Escape),
+                                ..
+                            },
+                        ..
+                    } => event_loop.exit(),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
 
 pub fn run() {
     env_logger::init();
     let event_loop = EventLoop::new().unwrap();
-    let window = WindowBuilder::new().build(&event_loop).unwrap();
+    let mut app = App::Uninitialized;
 
-    event_loop.run(move |event, control_flow| match event {
-        Event::WindowEvent {
-            ref event,
-            window_id,
-        } if window_id == window.id() => match event {
-            WindowEvent::CloseRequested
-            | WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        state: ElementState::Pressed,
-                        physical_key: PhysicalKey::Code(KeyCode::Escape),
-                        ..
-                    },
-                ..
-            } => control_flow.exit(),
-            _ => {}
-        },
-        _ => {}
-    });
+    event_loop.run_app(&mut app).unwrap();
 }
-
 ```
 
 All this does is create a window and keep it open until the user closes it or presses escape. Next, we'll need a `main.rs` to run the code. It's quite simple. It just imports `run()` and, well, runs it!
@@ -92,7 +117,7 @@ fn main() {
 }
 ```
 
-(Where 'tutorial1_window' is the name of the project you created with Cargo earlier)  
+(Where 'tutorial1_window' is the name of the project you created with Cargo earlier)
 
 If you only want to support desktops, that's all you have to do! In the next tutorial, we'll start using wgpu!
 
@@ -184,25 +209,37 @@ cfg_if::cfg_if! {
 This will set up `console_log` and `console_error_panic_hook` in a web build and will initialize `env_logger` in a normal build. This is important as `env_logger` doesn't support Web Assembly at the moment.
 
 Next, after we create our event loop and window, we need to add a canvas to the HTML document that we will host our application:
+To do this we need to access the window so we'll put this in the `resumed` function in our `ApplicationHandler impl`.
 
 ```rust
-#[cfg(target_arch = "wasm32")]
-{
-    // Winit prevents sizing with CSS, so we have to set
-    // the size manually when on web.
-    use winit::dpi::PhysicalSize;
-    let _ = window.request_inner_size(PhysicalSize::new(450, 400));
-    
-    use winit::platform::web::WindowExtWebSys;
-    web_sys::window()
-        .and_then(|win| win.document())
-        .and_then(|doc| {
-            let dst = doc.get_element_by_id("wasm-example")?;
-            let canvas = web_sys::Element::from(window.canvas()?);
-            dst.append_child(&canvas).ok()?;
-            Some(())
-        })
-        .expect("Couldn't append canvas to document body.");
+fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+    log::debug!("Resumed");
+
+    let window = event_loop
+        .create_window(Window::default_attributes())
+        .unwrap();
+
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Winit prevents sizing with CSS, so we have to set
+        // the size manually when on web.
+        use winit::dpi::PhysicalSize;
+        let _ = window.request_inner_size(PhysicalSize::new(450, 400));
+        use winit::platform::web::WindowExtWebSys;
+
+        web_sys::window()
+            .and_then(|win| win.document())
+            .and_then(|doc| {
+                let dst = doc.get_element_by_id("wasm-example")?;
+                let canvas = web_sys::Element::from(window.canvas()?);
+                dst.append_child(&canvas).ok()?;
+                Some(())
+            })
+            .expect("Couldn't append canvas to document body.");
+    }
+
+    *self = App::Initialized(AppState { window });
 }
 ```
 
