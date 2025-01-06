@@ -6,20 +6,18 @@ For convenience, we're going to pack all the fields into a struct and create som
 ```rust
 // lib.rs
 use winit::window::Window;
+use std::{sync::Arc};
 
-struct State<'a> {
-    surface: wgpu::Surface<'a>,
+struct State {
+    surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
-    // The window must be declared after the surface so
-    // it gets dropped after it as the surface contains
-    // unsafe references to the window's resources.
-    window: &'a Window,
+    window: Arc<Window>,
 }
 
-impl<'a> State<'a> {
+impl State {
     // Creating some of the wgpu types requires async code
     async fn new(window: &'a Window) -> State<'a> {
         todo!()
@@ -53,9 +51,10 @@ I'm glossing over `State`s fields, but they'll make more sense as I explain the 
 The code for this is pretty straightforward, but let's break it down a bit.
 
 ```rust
-impl<'a> State<'a> {
+impl State {
     // ...
-    async fn new(window: &'a Window) -> State<'a> {
+    async fn new(window: Window) -> State<'a> {
+        let window = Arc::new(window);
         let size = window.inner_size();
 
         // The instance is a handle to our GPU
@@ -67,8 +66,8 @@ impl<'a> State<'a> {
             backends: wgpu::Backends::GL,
             ..Default::default()
         });
-        
-        let surface = instance.create_surface(window).unwrap();
+
+        let surface = instance.create_surface(window.clone()).unwrap();
 
         let adapter = instance.request_adapter(
             &wgpu::RequestAdapterOptions {
@@ -79,6 +78,21 @@ impl<'a> State<'a> {
         ).await.unwrap();
     }
 ```
+
+<div class="note">
+
+You might be wondering why we're requesting webGL, isn't the whole point of webGPU that it's the new
+*web* graphics standard? Browser vendors are still working on integrating it and if we don't fallback to webGL your program might
+fail to load with no indication as to why. See [here](https://developer.mozilla.org/en-US/docs/Web/API/WebGPU_API) for more info.
+
+</div>
+
+<div class="note">
+
+Our surface needs to hold a handle to our window however, we also need a handle in order to request redraws or whatever other work we want to do with the handle. The bound on `create_surface` requires that our window
+`impl Into<SurfaceTarget<'_>>` which is `Send + Sync`. Do to these latter requirements we need to use `Arc`.
+
+</div>
 
 ### Instance and Adapter
 
@@ -211,7 +225,7 @@ Regardless, `PresentMode::Fifo` will always be supported, and `PresentMode::Auto
 Now that we've configured our surface properly, we can add these new fields at the end of the method.
 
 ```rust
-    async fn new(window: &'a Window) -> State<'a> {
+    async fn new(window: Window) -> State {
         // ...
 
         Self {
@@ -225,42 +239,7 @@ Now that we've configured our surface properly, we can add these new fields at t
     }
 ```
 
-Since our `State::new()` method is async, we need to change `run()` to be async as well so that we can await it.
-
-Our `window` has been moved to the State instance, we will need to update our `event_loop` to reflect this.
-
-```rust
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
-pub async fn run() {
-    // Window setup...
-
-    let mut state = State::new(&window).await;
-
-    event_loop.run(move |event, control_flow| {
-        match event {
-            Event::WindowEvent {
-                ref event,
-                window_id,
-            } if window_id == state.window().id() => match event {
-                WindowEvent::CloseRequested
-                | WindowEvent::KeyboardInput {
-                    event:
-                        KeyEvent {
-                            state: ElementState::Pressed,
-                            physical_key: PhysicalKey::Code(KeyCode::Escape),
-                            ..
-                        },
-                    ..
-                } => control_flow.exit(),
-                _ => {}
-            },
-            _ => {}
-        }
-    });
-}
-```
-
-Now that `run()` is async, `main()` will need some way to await the future. We could use a crate like [tokio](https://docs.rs/tokio), or [async-std](https://docs.rs/async-std), but I'm going to go with the much more lightweight [pollster](https://docs.rs/pollster). Add the following to your `Cargo.toml`:
+Since our `State::new()` method is async, we'll need some way to await the future. To do this we'll add the [pollster](https://docs.rs/pollster) lib which gives us a cross platform way to turn our async future into sync. Note that pollster is not smart and on web WASM only has a single executing thread. While it's usually bad practice to block in our case it doesn't make sense to continue with our application until we've initialized all our webGPU structures. Other crates like [tokio](https://docs.rs/tokio) or [async-std](https://docs.rs/async-std) would work as well but `pollster` is more lightweight.
 
 ```toml
 [dependencies]
@@ -271,39 +250,13 @@ pollster = "0.3"
 We then use the `block_on` function provided by pollster to await our future:
 
 ```rust
-fn main() {
-    pollster::block_on(run());
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        // ... other code
+
+        *self = App::Initialized(pollster::block_on(State::new(window)));
+    }
 }
-```
-
-<div class="warning">
-
-Don't use `block_on` inside of an async function if you plan to support WASM. Futures have to be run using the browser's executor. If you try to bring your own, your code will crash when you encounter a future that doesn't execute immediately.
-
-</div>
-
-If we try to build WASM now, it will fail because `wasm-bindgen` doesn't support using async functions as `start` methods. You could switch to calling `run` manually in javascript, but for simplicity, we'll add the [wasm-bindgen-futures](https://docs.rs/wasm-bindgen-futures) crate to our WASM dependencies as that doesn't require us to change any code. Your dependencies should look something like this:
-
-```toml
-[dependencies]
-cfg-if = "1"
-winit = { version = "0.29", features = ["rwh_05"] }
-env_logger = "0.10"
-log = "0.4"
-wgpu = "22.0"
-pollster = "0.3"
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-console_error_panic_hook = "0.1.6"
-console_log = "1.0"
-wgpu = { version = "22.0", features = ["webgl"]}
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = [
-    "Document",
-    "Window",
-    "Element",
-]}
 ```
 
 ## resize()
@@ -333,7 +286,7 @@ match event {
         match event {
             // ...
             WindowEvent::Resized(physical_size) => {
-                state.resize(*physical_size);
+                state.resize(physical_size);
             }
             // ...
         }
@@ -357,33 +310,58 @@ fn input(&mut self, event: &WindowEvent) -> bool {
 We need to do a little more work in the event loop. We want `State` to have priority over `run()`. Doing that (and previous changes) should make your loop look like this.
 
 ```rust
-// run()
-event_loop.run(move |event, control_flow| {
-    match event {
-        Event::WindowEvent {
-            ref event,
-            window_id,
-        } if window_id == state.window().id() => if !state.input(event) { // UPDATED!
-            match event {
-                WindowEvent::CloseRequested
-                | WindowEvent::KeyboardInput {
-                    event:
-                        KeyEvent {
-                            state: ElementState::Pressed,
-                            physical_key: PhysicalKey::Code(KeyCode::Escape),
+fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        if let App::Initialized(state) = self {
+            if window_id == state.window().id() {
+                if !state.input(&event) {
+                    // UPDATED!
+                    match event {
+                        WindowEvent::CloseRequested
+                        | WindowEvent::KeyboardInput {
+                            event:
+                                KeyEvent {
+                                    state: ElementState::Pressed,
+                                    physical_key: PhysicalKey::Code(KeyCode::Escape),
+                                    ..
+                                },
                             ..
-                        },
-                    ..
-                } => control_flow.exit(),
-                WindowEvent::Resized(physical_size) => {
-                    state.resize(*physical_size);
+                        } => event_loop.exit(),
+                        WindowEvent::Resized(physical_size) => {
+                            state.resize(physical_size);
+                        }
+                        WindowEvent::RedrawRequested => {
+                            // This tells winit that we want another frame after this one
+                            state.window().request_redraw();
+
+                            match state.render() {
+                                Ok(_) => {}
+                                // Reconfigure the surface if it's lost or outdated
+                                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                                    state.resize(state.size)
+                                }
+                                // The system is out of memory, we should probably quit
+                                Err(wgpu::SurfaceError::OutOfMemory) => {
+                                    log::error!("OutOfMemory");
+                                    event_loop.exit();
+                                }
+
+                                // This happens when the a frame takes too long to present
+                                Err(wgpu::SurfaceError::Timeout) => {
+                                    log::warn!("Surface timeout")
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                _ => {}
             }
         }
-        _ => {}
     }
-});
 ```
 
 ## update()
@@ -465,29 +443,29 @@ The last lines of the code tell `wgpu` to finish the command buffer and submit i
 We need to update the event loop again to call this method. We'll also call `update()` before it, too.
 
 ```rust
-// run()
-event_loop.run(move |event, control_flow| {
-    match event {
-        // ... with the other WindowEvents
+fn window_event(
+      &mut self,
+      event_loop: &winit::event_loop::ActiveEventLoop,
+      window_id: winit::window::WindowId,
+      event: WindowEvent,
+  ) {
+      //... other code
         WindowEvent::RedrawRequested => {
             // This tells winit that we want another frame after this one
             state.window().request_redraw();
 
-            if !surface_configured {
-                return;
-            }
-
+            // We added this !
             state.update();
             match state.render() {
                 Ok(_) => {}
                 // Reconfigure the surface if it's lost or outdated
-                Err(
-                    wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated,
-                ) => state.resize(state.size),
+                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                    state.resize(state.size)
+                }
                 // The system is out of memory, we should probably quit
                 Err(wgpu::SurfaceError::OutOfMemory) => {
                     log::error!("OutOfMemory");
-                    control_flow.exit();
+                    event_loop.exit();
                 }
 
                 // This happens when the a frame takes too long to present
@@ -496,9 +474,7 @@ event_loop.run(move |event, control_flow| {
                 }
             }
         }
-        // ...
-    }
-});
+  }
 ```
 
 With all that, you should be getting something that looks like this.
@@ -523,7 +499,7 @@ A `RenderPassDescriptor` only has three fields: `label`, `color_attachments` and
 
 <div class="note">
 
-The `color_attachments` field is a "sparse" array. This allows you to use a pipeline that expects multiple render targets and only supplies the ones you care about. 
+The `color_attachments` field is a "sparse" array. This allows you to use a pipeline that expects multiple render targets and only supplies the ones you care about.
 
 </div>
 

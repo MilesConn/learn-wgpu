@@ -18,9 +18,6 @@ struct State {
     config: wgpu::SurfaceConfiguration,
     clear_color: wgpu::Color,
     size: winit::dpi::PhysicalSize<u32>,
-    // The window must be declared after the surface so
-    // it gets dropped after it as the surface contains
-    // unsafe references to the window's resources.
     window: Arc<Window>,
 }
 
@@ -204,7 +201,7 @@ impl ApplicationHandler for App {
                 .expect("Couldn't append canvas to document body.");
         }
 
-        *self = App::Initialized(futures_executor::block_on(State::new(window)));
+        *self = App::Initialized(pollster::block_on(State::new(window)));
     }
 
     fn window_event(
