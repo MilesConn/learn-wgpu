@@ -161,14 +161,15 @@ This is the part where we finally make the thing in the title: the pipeline. Fir
 
 ```rust
 // lib.rs
-struct State<'a> {
-    surface: wgpu::Surface<'a>,
+struct State {
+    surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     // NEW!
     render_pipeline: wgpu::RenderPipeline,
+    window: Arc<Window>,
 }
 ```
 
@@ -290,6 +291,7 @@ Self {
     size,
     // NEW!
     render_pipeline,
+    window
 }
 ```
 
