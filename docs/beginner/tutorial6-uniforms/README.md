@@ -356,8 +356,8 @@ impl CameraController {
         let forward_mag = forward.magnitude();
 
         if self.is_right_pressed {
-            // Rescale the distance between the target and the eye so 
-            // that it doesn't change. The eye, therefore, still 
+            // Rescale the distance between the target and the eye so
+            // that it doesn't change. The eye, therefore, still
             // lies on the circle made by the target and eye.
             camera.eye = camera.target - (forward + right * self.speed).normalize() * forward_mag;
         }
@@ -381,8 +381,8 @@ struct State {
     // ...
 }
 // ...
-impl<'a> State<'a> {
-    async fn new(window: &'a Window) -> State<'a> {
+impl State {
+    async fn new(window: Window) -> State {
         // ...
         let camera_controller = CameraController::new(0.2);
         // ...
