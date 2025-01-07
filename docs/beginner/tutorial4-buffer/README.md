@@ -112,6 +112,7 @@ Self {
     size,
     render_pipeline,
     vertex_buffer,
+    window,
 }
 ```
 
@@ -264,6 +265,7 @@ impl<'a> State<'a> {
             render_pipeline,
             vertex_buffer,
             num_vertices,
+            window,
         }
     }
 }
@@ -383,8 +385,8 @@ let num_indices = INDICES.len() as u32;
 We don't need to implement `Pod` and `Zeroable` for our indices because `bytemuck` has already implemented them for basic types such as `u16`. That means we can just add `index_buffer` and `num_indices` to the `State` struct.
 
 ```rust
-struct State<'a> {
-    surface: wgpu::Surface<'a>,
+struct State {
+    surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -392,8 +394,9 @@ struct State<'a> {
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     // NEW!
-    index_buffer: wgpu::Buffer, 
+    index_buffer: wgpu::Buffer,
     num_indices: u32,
+    window: Arc<Window>,
 }
 ```
 
@@ -411,6 +414,7 @@ Self {
     // NEW!
     index_buffer,
     num_indices,
+    window,
 }
 ```
 
