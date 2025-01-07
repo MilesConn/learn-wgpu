@@ -242,7 +242,7 @@ Looking at this, you might get a bit of déjà vu! That's because a `BindGroup` 
 Now that we have our `diffuse_bind_group`, let's add it to our `State` struct:
 
 ```rust
-struct State<'a> {
+struct State {
     surface: wgpu::Surface<'a>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -259,7 +259,7 @@ struct State<'a> {
 Make sure we return these fields in the `new` method:
 
 ```rust
-impl<'a> State<'a> {
+impl State {
     async fn new() -> Self {
         // ...
         Self {
@@ -472,7 +472,7 @@ impl Texture {
     pub fn from_bytes(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        bytes: &[u8], 
+        bytes: &[u8],
         label: &str
     ) -> Result<Self> {
         let img = image::load_from_memory(bytes)?;
@@ -534,7 +534,7 @@ impl Texture {
                 ..Default::default()
             }
         );
-        
+
         Ok(Self { texture, view, sampler })
     }
 }
@@ -594,7 +594,7 @@ struct State {
 ```
 
 ```rust
-impl<'a> State<'a> {
+impl State {
     async fn new() -> Self {
         // ...
         Self {
