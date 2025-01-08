@@ -1,12 +1,14 @@
-use std::{f32::consts::PI, iter};
+use std::{f32::consts::PI, iter, sync::Arc};
 
 use cgmath::prelude::*;
+use instant::Instant;
 use wgpu::util::DeviceExt;
 use winit::{
+    application::ApplicationHandler,
     event::*,
     event_loop::EventLoop,
     keyboard::{KeyCode, PhysicalKey},
-    window::Window,
+    window::{Window, WindowAttributes},
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -131,9 +133,9 @@ struct LightUniform {
     _padding2: u32,
 }
 
-struct State<'a> {
-    window: &'a Window,
-    surface: wgpu::Surface<'a>,
+struct State {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -158,6 +160,7 @@ struct State<'a> {
     debug_material: model::Material,
     // NEW!
     mouse_pressed: bool,
+    last_render_time: Instant,
 }
 
 fn create_render_pipeline(
@@ -223,8 +226,9 @@ fn create_render_pipeline(
     })
 }
 
-impl<'a> State<'a> {
-    async fn new(window: &'a Window) -> State<'a> {
+impl State {
+    async fn new(window: Window, last_render_time: Instant) -> State {
+        let window = Arc::new(window);
         let size = window.inner_size();
 
         // The instance is a handle to our GPU
@@ -237,7 +241,7 @@ impl<'a> State<'a> {
             ..Default::default()
         });
 
-        let surface = instance.create_surface(window).unwrap();
+        let surface = instance.create_surface(window.clone()).unwrap();
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -543,6 +547,7 @@ impl<'a> State<'a> {
             debug_material,
             // NEW!
             mouse_pressed: false,
+            last_render_time,
         }
     }
 
@@ -679,95 +684,136 @@ impl<'a> State<'a> {
     }
 }
 
+enum App {
+    Uninitialized,
+    Initialized(State),
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        log::debug!("Resumed");
+
+        let title = env!("CARGO_PKG_NAME");
+        let window = event_loop
+            .create_window(WindowAttributes::default().with_title(title))
+            .unwrap();
+
+        window.request_redraw();
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Winit prevents sizing with CSS, so we have to set
+            // the size manually when on web.
+            use winit::dpi::PhysicalSize;
+            let _ = window.request_inner_size(PhysicalSize::new(450, 400));
+
+            use winit::platform::web::WindowExtWebSys;
+            web_sys::window()
+                .and_then(|win| win.document())
+                .and_then(|doc| {
+                    let dst = doc.get_element_by_id("wasm-example")?;
+                    let canvas = web_sys::Element::from(window.canvas()?);
+                    dst.append_child(&canvas).ok()?;
+                    Some(())
+                })
+                .expect("Couldn't append canvas to document body.");
+        }
+
+        *self = App::Initialized(pollster::block_on(State::new(
+            window,
+            instant::Instant::now(),
+        )));
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        if let App::Initialized(state) = self {
+            if window_id == state.window().id() {
+                if !state.input(&event) {
+                    // UPDATED!
+                    match event {
+                        WindowEvent::CloseRequested
+                        | WindowEvent::KeyboardInput {
+                            event:
+                                KeyEvent {
+                                    state: ElementState::Pressed,
+                                    physical_key: PhysicalKey::Code(KeyCode::Escape),
+                                    ..
+                                },
+                            ..
+                        } => event_loop.exit(),
+                        WindowEvent::Resized(physical_size) => {
+                            log::info!("physical_size: {physical_size:?}");
+                            state.resize(physical_size);
+                        }
+                        WindowEvent::RedrawRequested => {
+                            // This tells winit that we want another frame after this one
+                            state.window().request_redraw();
+                            let now = instant::Instant::now();
+                            let dt = now - state.last_render_time;
+                            state.last_render_time = now;
+                            state.update(dt);
+                            match state.render() {
+                                Ok(_) => {}
+                                // Reconfigure the surface if it's lost or outdated
+                                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                                    state.resize(state.size)
+                                }
+                                // The system is out of memory, we should probably quit
+                                Err(wgpu::SurfaceError::OutOfMemory) => {
+                                    log::error!("OutOfMemory");
+                                    event_loop.exit();
+                                }
+
+                                // This happens when the a frame takes too long to present
+                                Err(wgpu::SurfaceError::Timeout) => {
+                                    log::warn!("Surface timeout")
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let App::Initialized(state) = self {
+            match event {
+                DeviceEvent::MouseMotion { delta } => {
+                    if state.mouse_pressed {
+                        state.camera_controller.process_mouse(delta.0, delta.1);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
-pub async fn run() {
+pub fn run() {
     cfg_if::cfg_if! {
         if #[cfg(target_arch = "wasm32")] {
             std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-            console_log::init_with_level(log::Level::Info).expect("Could't initialize logger");
+            console_log::init_with_level(log::Level::Warn).expect("Could't initialize logger");
         } else {
             env_logger::init();
         }
     }
 
     let event_loop = EventLoop::new().unwrap();
-    let title = env!("CARGO_PKG_NAME");
-    let window = winit::window::WindowBuilder::new()
-        .with_title(title)
-        .build(&event_loop)
-        .unwrap();
+    let mut app = App::Uninitialized;
 
-    #[cfg(target_arch = "wasm32")]
-    {
-        // Winit prevents sizing with CSS, so we have to set
-        // the size manually when on web.
-        use winit::dpi::PhysicalSize;
-        let _ = window.request_inner_size(PhysicalSize::new(450, 400));
-
-        use winit::platform::web::WindowExtWebSys;
-        web_sys::window()
-            .and_then(|win| win.document())
-            .and_then(|doc| {
-                let dst = doc.get_element_by_id("wasm-example")?;
-                let canvas = web_sys::Element::from(window.canvas()?);
-                dst.append_child(&canvas).ok()?;
-                Some(())
-            })
-            .expect("Couldn't append canvas to document body.");
-    }
-
-    let mut state = State::new(&window).await; // NEW!
-    let mut last_render_time = instant::Instant::now();
-    event_loop.run(move |event, control_flow| {
-        match event {
-            // NEW!
-            Event::DeviceEvent {
-                event: DeviceEvent::MouseMotion{ delta, },
-                .. // We're not using device_id currently
-            } => if state.mouse_pressed {
-                state.camera_controller.process_mouse(delta.0, delta.1)
-            }
-            // UPDATED!
-            Event::WindowEvent {
-                ref event,
-                window_id,
-            } if window_id == state.window().id() && !state.input(event) => {
-                match event {
-                    #[cfg(not(target_arch="wasm32"))]
-                    WindowEvent::CloseRequested
-                    | WindowEvent::KeyboardInput {
-                        event:
-                            KeyEvent {
-                                state: ElementState::Pressed,
-                                physical_key: PhysicalKey::Code(KeyCode::Escape),
-                                ..
-                            },
-                        ..
-                    } => control_flow.exit(),
-                    WindowEvent::Resized(physical_size) => {
-                        state.resize(*physical_size);
-                    }
-                    // UPDATED!
-                    WindowEvent::RedrawRequested => {
-                        state.window().request_redraw();
-                        let now = instant::Instant::now();
-                        let dt = now - last_render_time;
-                        last_render_time = now;
-                        state.update(dt);
-                        match state.render() {
-                            Ok(_) => {}
-                            // Reconfigure the surface if it's lost or outdated
-                            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => state.resize(state.size),
-                            // The system is out of memory, we should probably quit
-                            Err(wgpu::SurfaceError::OutOfMemory) => control_flow.exit(),
-                            // We're ignoring timeouts
-                            Err(wgpu::SurfaceError::Timeout) => log::warn!("Surface timeout"),
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }).unwrap();
+    event_loop.run_app(&mut app).unwrap();
 }
