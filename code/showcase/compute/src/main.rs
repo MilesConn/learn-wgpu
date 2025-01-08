@@ -1,13 +1,14 @@
 use cgmath::prelude::*;
 use rayon::prelude::*;
-use std::iter;
+use std::{iter, sync::Arc, time::Instant};
 use wgpu::util::DeviceExt;
 use winit::{
+    application::ApplicationHandler,
     dpi::PhysicalPosition,
     event::*,
     event_loop::EventLoop,
     keyboard::{KeyCode, PhysicalKey},
-    window::Window,
+    window::{Window, WindowAttributes},
 };
 
 mod camera;
@@ -130,8 +131,8 @@ struct LightUniform {
     _padding2: u32,
 }
 
-struct State<'a> {
-    surface: wgpu::Surface<'a>,
+struct State {
+    surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -156,11 +157,13 @@ struct State<'a> {
     debug_material: model::Material,
     last_mouse_pos: PhysicalPosition<f64>,
     mouse_pressed: bool,
-    window: &'a Window,
+    last_render_time: Instant,
+    window: Arc<Window>,
 }
 
-impl<'a> State<'a> {
-    async fn new(window: &'a Window) -> State<'a> {
+impl State {
+    async fn new(window: Window, last_render_time: Instant) -> State {
+        let window = Arc::new(window);
         let size = window.inner_size();
 
         // The instance is a handle to our GPU
@@ -173,7 +176,7 @@ impl<'a> State<'a> {
             ..Default::default()
         });
 
-        let surface = instance.create_surface(window).unwrap();
+        let surface = instance.create_surface(window.clone()).unwrap();
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -484,6 +487,7 @@ impl<'a> State<'a> {
             debug_material,
             last_mouse_pos: (0.0, 0.0).into(),
             mouse_pressed: false,
+            last_render_time,
         }
     }
 
@@ -631,26 +635,57 @@ impl<'a> State<'a> {
 }
 
 fn main() {
-    pollster::block_on(run());
+    run();
 }
 
-async fn run() {
-    env_logger::init();
-    let event_loop = EventLoop::new().unwrap();
-    let title = env!("CARGO_PKG_NAME");
-    let window = winit::window::WindowBuilder::new()
-        .with_title(title)
-        .build(&event_loop)
-        .unwrap();
-    let mut state = State::new(&window).await; // NEW!
-    let mut last_render_time = std::time::Instant::now();
-    event_loop
-        .run(move |event, control_flow| match event {
-            Event::WindowEvent {
-                ref event,
-                window_id,
-            } if window_id == state.window().id() => {
-                if !state.input(event) {
+enum App {
+    Uninitialized,
+    Initialized(State),
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        log::debug!("Resumed");
+
+        let title = env!("CARGO_PKG_NAME");
+        let window = event_loop
+            .create_window(WindowAttributes::default().with_title(title))
+            .unwrap();
+
+        window.request_redraw();
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Winit prevents sizing with CSS, so we have to set
+            // the size manually when on web.
+            use winit::dpi::PhysicalSize;
+            let _ = window.request_inner_size(PhysicalSize::new(450, 400));
+
+            use winit::platform::web::WindowExtWebSys;
+            web_sys::window()
+                .and_then(|win| win.document())
+                .and_then(|doc| {
+                    let dst = doc.get_element_by_id("wasm-example")?;
+                    let canvas = web_sys::Element::from(window.canvas()?);
+                    dst.append_child(&canvas).ok()?;
+                    Some(())
+                })
+                .expect("Couldn't append canvas to document body.");
+        }
+
+        *self = App::Initialized(pollster::block_on(State::new(window, Instant::now())));
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        if let App::Initialized(state) = self {
+            if window_id == state.window().id() {
+                if !state.input(&event) {
+                    // UPDATED!
                     match event {
                         WindowEvent::CloseRequested
                         | WindowEvent::KeyboardInput {
@@ -661,15 +696,17 @@ async fn run() {
                                     ..
                                 },
                             ..
-                        } => control_flow.exit(),
+                        } => event_loop.exit(),
                         WindowEvent::Resized(physical_size) => {
-                            state.resize(*physical_size);
+                            log::info!("physical_size: {physical_size:?}");
+                            state.resize(physical_size);
                         }
                         WindowEvent::RedrawRequested => {
-                            state.window.request_redraw();
-                            let now = std::time::Instant::now();
-                            let dt = now - last_render_time;
-                            last_render_time = now;
+                            // This tells winit that we want another frame after this one
+                            state.window().request_redraw();
+                            let now = Instant::now();
+                            let dt = now - state.last_render_time;
+                            state.last_render_time = now;
                             state.update(dt);
                             state.render();
                         }
@@ -677,7 +714,33 @@ async fn run() {
                     }
                 }
             }
-            _ => {}
-        })
-        .unwrap();
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let App::Initialized(state) = self {
+            match event {
+                DeviceEvent::MouseMotion { delta } => {
+                    if state.mouse_pressed {
+                        state.camera_controller.process_mouse(delta.0, delta.1);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+pub fn run() {
+    env_logger::init();
+
+    let event_loop = EventLoop::new().unwrap();
+    let mut app = App::Uninitialized;
+
+    event_loop.run_app(&mut app).unwrap();
 }
