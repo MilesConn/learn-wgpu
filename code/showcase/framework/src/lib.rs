@@ -17,23 +17,26 @@ pub use texture::*;
 
 use anyhow::*;
 use cgmath::*;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
+use winit::application::ApplicationHandler;
 use winit::event::*;
-use winit::event_loop::{ControlFlow, EventLoop};
+use winit::event_loop::EventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowBuilder};
+use winit::window::{Window, WindowAttributes};
 
-pub struct Display<'a> {
-    surface: wgpu::Surface<'a>,
-    pub window: &'a Window,
+pub struct Display {
+    surface: wgpu::Surface<'static>,
+    pub window: Arc<Window>,
     pub config: wgpu::SurfaceConfiguration,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
 }
 
-impl<'a> Display<'a> {
-    pub async fn new(window: &'a Window) -> Result<Display<'a>, Error> {
+impl Display {
+    pub async fn new(window: Window) -> Result<Display, Error> {
+        let window = Arc::new(window);
         let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             #[cfg(not(target_arch = "wasm32"))]
@@ -42,7 +45,7 @@ impl<'a> Display<'a> {
             backends: wgpu::Backends::GL,
             ..Default::default()
         });
-        let surface = instance.create_surface(window).unwrap();
+        let surface = instance.create_surface(window.clone()).unwrap();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::default(),
@@ -225,74 +228,115 @@ pub trait Demo: 'static + Sized {
     fn render(&mut self, display: &mut Display);
 }
 
-pub async fn run<D: Demo>() -> Result<(), Error> {
-    wgpu_subscriber::initialize_default_subscriber(None);
+enum App<D: Demo> {
+    Uninitialized,
+    Initialized { display: Display, demo: D },
+}
 
-    let event_loop = EventLoop::new().unwrap();
-    let window = WindowBuilder::new()
-        .with_title(env!("CARGO_PKG_NAME"))
-        .build(&event_loop)?;
-    let mut display = Display::new(&window).await?;
-    let mut demo = D::init(&display)?;
-    let mut last_update = Instant::now();
-    let mut is_resumed = true;
-    let mut is_focused = true;
-    let _is_redraw_requested = true;
+impl<D: Demo> ApplicationHandler for App<D> {
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        log::debug!("Resumed");
 
-    event_loop.run(move |event, control_flow| {
-        if is_resumed && is_focused {
-            control_flow.set_control_flow(ControlFlow::Poll)
-        } else {
-            control_flow.set_control_flow(ControlFlow::Wait)
-        };
+        let title = env!("CARGO_PKG_NAME");
+        let window = event_loop
+            .create_window(WindowAttributes::default().with_title(title))
+            .unwrap();
 
-        match event {
-            Event::Resumed => is_resumed = true,
-            Event::Suspended => is_resumed = false,
-            Event::WindowEvent {
-                event, window_id, ..
-            } => {
-                if window_id == display.window().id() {
-                    match event {
-                        WindowEvent::CloseRequested => control_flow.exit(),
-                        WindowEvent::Focused(f) => is_focused = f,
-                        WindowEvent::Resized(new_inner_size) => {
-                            display.resize(new_inner_size.width, new_inner_size.height);
-                            demo.resize(&display);
-                        }
-                        WindowEvent::KeyboardInput {
-                            event:
-                                KeyEvent {
-                                    physical_key: PhysicalKey::Code(key),
-                                    state,
-                                    ..
-                                },
-                            ..
-                        } => {
-                            demo.process_keyboard(key, state == ElementState::Pressed);
-                        }
-                        WindowEvent::RedrawRequested => {
-                            let now = Instant::now();
-                            let dt = now - last_update;
-                            last_update = now;
+        window.request_redraw();
 
-                            demo.update(&display, dt);
-                            demo.render(&mut display);
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Winit prevents sizing with CSS, so we have to set
+            // the size manually when on web.
+            use winit::dpi::PhysicalSize;
+            let _ = window.request_inner_size(PhysicalSize::new(450, 400));
 
-                            if is_focused && is_resumed {
-                                display.window().request_redraw();
-                            } else {
-                                // Freeze time while the demo is not in the foreground
-                                last_update = Instant::now();
-                            }
-                        }
-                        _ => {}
+            use winit::platform::web::WindowExtWebSys;
+            web_sys::window()
+                .and_then(|win| win.document())
+                .and_then(|doc| {
+                    let dst = doc.get_element_by_id("wasm-example")?;
+                    let canvas = web_sys::Element::from(window.canvas()?);
+                    dst.append_child(&canvas).ok()?;
+                    Some(())
+                })
+                .expect("Couldn't append canvas to document body.");
+        }
+
+        let display = pollster::block_on(Display::new(window)).unwrap();
+        let demo = D::init(&display).unwrap();
+        *self = App::Initialized { display, demo };
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        if let App::Initialized { display, demo } = self {
+            if window_id == display.window().id() {
+                match event {
+                    WindowEvent::CloseRequested
+                    | WindowEvent::KeyboardInput {
+                        event:
+                            KeyEvent {
+                                state: ElementState::Pressed,
+                                physical_key: PhysicalKey::Code(KeyCode::Escape),
+                                ..
+                            },
+                        ..
+                    } => event_loop.exit(),
+                    WindowEvent::KeyboardInput {
+                        event:
+                            KeyEvent {
+                                physical_key: PhysicalKey::Code(key_code),
+                                state,
+                                ..
+                            },
+                        ..
+                    } => {
+                        demo.process_keyboard(key_code, state.is_pressed());
                     }
+                    WindowEvent::Resized(physical_size) => {
+                        log::info!("physical_size: {physical_size:?}");
+                        display.resize(physical_size.width, physical_size.height);
+                    }
+                    WindowEvent::RedrawRequested => {
+                        // This tells winit that we want another frame after this one
+                        display.window().request_redraw();
+                        demo.render(display);
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
         }
-    })?;
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let App::Initialized { demo, .. } = self {
+            match event {
+                DeviceEvent::MouseMotion { delta } => {
+                    demo.process_mouse(delta.0, delta.1);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+pub fn run<D: Demo>() -> Result<()> {
+    env_logger::init();
+
+    let event_loop = EventLoop::new().unwrap();
+    let mut app: App<D> = App::Uninitialized;
+
+    event_loop.run_app(&mut app).unwrap();
 
     Ok(())
 }
